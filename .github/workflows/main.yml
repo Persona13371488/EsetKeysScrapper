@@ -1,0 +1,104 @@
+# Build EsetKeysConsole and run license generation on GitHub Actions.
+# Results are uploaded as a workflow artifact (licenses.txt + full log).
+#
+# How to run:
+#   Actions → Generate Keys → Run workflow
+#   Optional inputs: number of licenses, domain length
+# Optional secret:
+#   PROXY_LIST — multiline "protocol://ip:port" list (used as -p)
+
+name: Generate Keys
+
+on:
+  workflow_dispatch:
+    inputs:
+      number:
+        description: "Number of licenses to generate (-n)"
+        required: false
+        default: "1"
+        type: string
+      length:
+        description: "Temp mail domain length (-l), 5–25"
+        required: false
+        default: "10"
+        type: string
+  # Uncomment to run on a schedule (UTC):
+  # schedule:
+  #   - cron: "0 6 * * *"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: generate-keys
+  cancel-in-progress: false
+
+jobs:
+  generate:
+    name: Build & generate
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            cmake \
+            libcurl4-openssl-dev \
+            libssl-dev \
+            nlohmann-json3-dev
+
+      - name: Configure & build (console only)
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_QT_VERSION=OFF
+          cmake --build build --target EsetKeysConsole -j"$(nproc)"
+          test -x build/bin/EsetKeysConsole
+
+      - name: Prepare proxy file (optional)
+        env:
+          PROXY_LIST: ${{ secrets.PROXY_LIST }}
+        run: |
+          if [ -n "${PROXY_LIST:-}" ]; then
+            printf '%s\n' "$PROXY_LIST" > proxies.txt
+            echo "Proxy list written ($(wc -l < proxies.txt) lines)"
+          else
+            echo "No PROXY_LIST secret — running without proxy"
+          fi
+
+      - name: Generate licenses
+        id: generate
+        env:
+          NUM: ${{ inputs.number || '1' }}
+          LEN: ${{ inputs.length || '10' }}
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          ARGS=(-n "$NUM" -l "$LEN")
+          if [ -f proxies.txt ]; then
+            ARGS+=(-p proxies.txt)
+          fi
+          echo "Running: ./build/bin/EsetKeysConsole ${ARGS[*]}"
+          # Capture full console output (keys are printed to stdout)
+          ./build/bin/EsetKeysConsole "${ARGS[@]}" 2>&1 | tee out/run.log
+          # Extract likely key-ish lines for a cleaner artifact
+          # (keeps non-ANSI text; full log still has everything)
+          sed 's/\x1b\[[0-9;]*m//g' out/run.log > out/licenses.txt
+          echo "Done. Artifacts will be uploaded from out/"
+
+      - name: Upload licenses artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eset-licenses-${{ github.run_id }}
+          path: |
+            out/licenses.txt
+            out/run.log
+          if-no-files-found: warn
+          retention-days: 7
